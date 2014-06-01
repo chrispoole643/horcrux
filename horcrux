@@ -1,0 +1,341 @@
+#!/bin/bash -
+
+################################################################################
+## horcrux [options] operation backup_name [restore path]
+## ======================================================
+##
+## Makes running duplicity for secure offsite backups easy.
+##
+## Version: 20130209
+## URL: chrispoole.com/project/horcrux
+################################################################################
+
+# Copyright (C) 2013 Chris Poole <chris@chrispoole.com>
+# 
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+# 
+# This program is distributed in the hope that it will be useful, but WITHOUT ANY
+# WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+# PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License along with
+# this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+if [[ "${OSTYPE%%.*}" = "darwin10" || "${OSTYPE%%.*}" = "darwin13" ]]; then
+    platform="mac"
+elif [[ "$OSTYPE" = "linux-gnu" ]]; then
+    platform="linux"
+fi
+
+horcrux_directory="$HOME/.horcrux"
+
+if [[ ! -d "$horcrux_directory" ]]; then
+    mkdir -p "$horcrux_directory"
+fi
+
+# Keep rarely-changing variables (like $source, $remove_n, etc.) here
+if [[ -f "$horcrux_directory/horcrux.conf" ]]; then
+    source "$horcrux_directory/horcrux.conf"
+else
+    printf "$(basename $0): configuration file $horcrux_directory/horcrux.conf not found.\n"
+    printf "File created. Populate it with your own details.\n"
+    cat > "$horcrux_directory/horcrux.conf" <<EOF
+source="$HOME/"          # Ensure trailing slash
+encrypt_key=ABCD1234     # Public key ID to encrypt backups with
+sign_key='-'             # Key ID to sign backups with (leave as '-' for no signing)
+
+use_agent=false          # Use gpg-agent?
+remove_n=3               # Number of full filesets to remove
+verbosity=5              # Logs all the file changes (see duplicity man page)
+vol_size=25              # Split the backup into 25MB volumes
+full_if_old=360D         # Cause 'full' operation to perform a full
+                         # backup if older than 360 days
+backup_basename='backup' # Directory name for local backups (i.e., destination
+                         # /Volumes/my_drive/backup/ or /media/my_drive/backup/)
+dup_params=''            # Parameters to pass to Duplicity
+EOF
+    exit 1
+fi
+
+file='-'
+dry_run=false
+time='now'
+
+if [[ "$platform" == "mac" ]]; then
+    # Allow more open files
+    ulimit -n 2048
+fi
+
+_show_help () {
+    printf -- "Usage: horcrux [OPTIONS] OPERATION BACKUP_NAME [RESTORE PATH]\n\n"
+    printf "Options:\n"
+    printf -- "-a: use gpg-agent ($use_agent)\n"
+    printf -- "-c: number of full filesets to leave during remove operation ($remove_n)\n"
+    printf -- "-f: file to restore\n"
+    printf -- "-h: show help (this text)\n"
+    printf -- "-k: encryption key ($encrypt_key)\n"
+    printf -- "-i: signing key ($sign_key)\n"
+    printf -- "-n: dry run ($dry_run)\n"
+    printf -- "-o: make auto operation run full backup if older than ($full_if_old)\n"
+    printf -- "-s: backup source ($source)\n"
+    printf -- "-t: time to restore file or directory from\n"
+    printf -- "-v: verbosity ($verbosity)\n"
+    printf -- "-z: volume size in MB ($vol_size)\n\n"
+
+    printf "Operations:\n"
+    printf "auto:\t\t full backup if no filesets or last full backup > $full_if_old old, else incremental\n"
+    printf "check:\t\t check md5 hashes of files in restored fileset against local fileset\n"
+    printf "clean:\t\t clean local caches\n"
+    printf "full:\t\t perform full backup\n"
+    printf "inc:\t\t perform incremental backup\n"
+    printf "list:\t\t list files backed up in fileset\n"
+    printf "remove:\t\t remove filesets, leaving latest $remove_n full+inc filesets\n"
+    printf "restore:\t restore files/directories or complete filesets\n"
+    printf "status:\t\t check collection status on fileset\n"
+    printf "verify:\t\t check stored hashes against stored filesets\n\n"
+
+    printf "Time format:\t YYYY-MM-DD, or interval using characters s, m, h, D, W, M, or Y. 1h78m, etc.\n"
+
+    exit 0
+}
+
+_report_error () {
+    printf "$(basename $0): $1.\n" >&2
+    exit 1
+}
+
+################################################################################
+## Option parsing
+################################################################################
+
+# Parse single-letter options
+while getopts :f:nat:c:v:k:i:o:s:z:h opt; do
+    case "$opt" in
+        a)    use_agent=true
+              ;;
+        f)    file="$OPTARG"
+              ;;
+        n)    dry_run=true
+              ;;
+        t)    time="$OPTARG"
+              ;;
+        c)    remove_n="$OPTARG"
+              ;;
+        v)    verbosity="$OPTARG"
+              ;;
+        k)    encrypt_key="$OPTARG"
+              ;;
+        i)    sign_key="$OPTARG"
+              ;;
+        o)    full_if_old="$OPTARG"
+              ;;
+        s)    source="$OPTARG"
+              ;;
+        z)    vol_size="$OPTARG"
+              ;;
+        h)    _show_help
+              ;;
+        '?')  _report_error "invalid option $OPTARG. Try 'horcrux help' for more info"
+              ;;
+    esac
+done
+
+# Forget single-letter options now, put main options out in front
+shift $((OPTIND-1))
+
+operation="$1"
+config_file="$2-config"
+destination=${config_file%%-*}
+restore_path=${3:-'-'}
+log_file="$horcrux_directory/$destination.log"
+zip_log_file="$log_file.bz2"
+exclude_file="$horcrux_directory/$destination-exclude"
+restore_hashes_file="$horcrux_directory/$destination-restore-hashes.log"
+restore_hashes_filenames_file="$horcrux_directory/$destination-restore-hashes-filenames.log"
+changed_hashes_file="$horcrux_directory/$destination-changed-hashes.log.bz2"
+
+if [[ "$operation" == "help" ]]; then
+        _show_help
+fi
+
+if [[ "$operation" == "" || "$config_file" == "-config" ]]; then
+    _report_error "operation and destination must be supplied"
+fi
+
+# Load config file, containing $destination_path. If there's no config file,
+# fall back to checking for a locally mounted drive and set the destination path
+# manually.
+if [[ -f "$horcrux_directory/$config_file" ]]; then
+    source "$horcrux_directory/$config_file"
+elif [[ -d "/Volumes/$destination/$backup_basename/" ]]; then
+    destination_path="file:///Volumes/$destination/$backup_basename/"
+elif [[ -d "/media/$destination/$backup_basename/" ]]; then
+    destination_path="file:///media/$destination/$backup_basename/"
+else
+    _report_error "config file $horcrux_directory/$config_file not found.\nDestination \
+directory /Volumes/$destination/$backup_basename/ not found"
+fi
+
+# Set duplicity parameters
+dup_params="-v$verbosity --name $destination --allow-source-mismatch --encrypt-key $encrypt_key $dup_params"
+
+if [[ "$file" != '-' ]]; then
+    dup_params="--file-to-restore $file $dup_params"
+fi
+if [[ "$dry_run" == true ]]; then
+    dup_params="--dry-run $dup_params"
+fi
+if [[ "$use_agent" == true ]]; then
+    dup_params="--use-agent $dup_params"
+fi
+if [[ ! "$sign_key" == '-' ]]; then
+    dup_params="--sign-key $sign_key $dup_params"
+fi
+if [[ "$time" != "now" ]]; then
+    dup_params="-t$time $dup_params"
+fi
+if [[ "$vol_size" != 25 ]]; then
+    dup_params="--volsize $vol_size $dup_params"
+fi
+
+# Quick checks
+if [[ ! -d "$source" ]]; then
+    _report_error "source directory $source not found"
+fi
+
+if [[ ! -f "$exclude_file" ]]; then
+    touch "$exclude_file"
+    _report_error "exclude file $exclude_file not found.\n
+It has been created for you. See duplicity manpage for syntax and examples"
+fi
+
+################################################################################
+## Core commands
+################################################################################
+
+if [[ "$operation" == "help" ]]; then
+    _show_help
+fi
+
+zip_cmd=$(type -p pbzip2 || type -p bzip2)
+unzip_cmd=$(type -p pbunzip2 || type -p bunzip2)
+
+# Unzip log file first
+if [[ -f "$zip_log_file" ]]; then
+    printf "$(basename $0): found existing log file. Unzipping..."
+    eval "$unzip_cmd" "$zip_log_file"
+    printf " Done.\n\n"
+fi
+
+# Add comment showing when backup started
+printf "\n### Starting horcrux at $(date "+%Y%m%d-%H%M")\n\n" >> "$log_file"
+
+printf "[$operation] "
+
+case "$operation" in
+    auto)
+        printf "Backing up selected directories to $destination...\n\n"
+        duplicity --full-if-older-than "$full_if_old" --exclude-globbing-filelist \
+            "$exclude_file" $dup_params "$source" \
+            "$destination_path" \
+            2>&1 | tee -a "$log_file"
+        ;;
+    full)
+        printf "Backing up selected directories to $destination...\n\n"
+        duplicity full --exclude-globbing-filelist \
+            "$exclude_file" $dup_params "$source" \
+            "$destination_path" \
+            2>&1 | tee -a "$log_file"
+        ;;
+    inc)
+        printf "Backing up selected directories to $destination...\n\n"
+        duplicity incremental --exclude-globbing-filelist \
+            "$exclude_file" $dup_params "$source" \
+            "$destination_path" \
+            2>&1 | tee -a "$log_file"
+        ;;
+    clean)
+        printf "Cleaning up $destination backup files...\n\n"
+        duplicity cleanup --extra-clean --force $dup_params "$destination_path" \
+            2>&1 | tee -a "$log_file"
+        ;;
+    restore)
+            printf "Restoring $destination to $restore_path...\n\n"
+            duplicity restore $dup_params "$destination_path" "$restore_path" \
+                2>&1 | tee -a "$log_file"
+        ;;
+    verify)
+        if [[ -d "$restore_path" ]]; then
+            printf "Verifying backup filesets on $destination...\n\n"
+            duplicity verify $dup_params "$destination_path" "$restore_path" \
+                2>&1 | tee -a "$log_file"
+        else
+            _report_error "restore path $restore_path not a directory"
+        fi
+        ;;
+    remove)
+        printf "Removing backup sets older than $remove_n full on $destination...\n\n"
+        duplicity remove-all-but-n-full "$remove_n" --force $dup_params "$destination_path" \
+            2>&1 | tee -a "$log_file"
+        ;;
+    status)
+        printf "Checking collection status on $destination...\n\n"
+        duplicity collection-status $dup_params "$destination_path" \
+            2>&1 | tee -a "$log_file"
+        ;;
+    paramtest)
+        printf "Checking parameters...\n\n"
+        printf "Source: $source\n"
+        printf "Destination: $destination\n"
+        printf "Destination path: $destination_path\n"
+        printf "Parameters: $dup_params\n"
+        ;;
+    list)
+        printf "Listing files on $destination...\n\n"
+        duplicity list-current-files $dup_params "$destination_path" \
+            2>&1 | tee -a "$log_file"
+        ;;
+    check)
+        if [[ -d "$restore_path" ]]; then
+            if [[ $(type -t md5deep) == "file" ]]; then
+                cd "$restore_path"
+                printf "Computing hashes for restored fileset... "
+                # Only hash regular files; ignore symbolic links
+                md5deep -lro f . >| "$restore_hashes_file"
+                printf "Done.\n"
+                # 32 chars (for md5) + 5 (to remove spaces and './'). sha256deep
+                # outputs 64 chars (hex)
+                cut -c37- "$restore_hashes_file" >| "$restore_hashes_filenames_file"
+                cd "$source"
+                printf "Checking computed hashes against local fileset...\n"
+                md5deep -lx "$restore_hashes_file" \
+                    -f "$restore_hashes_filenames_file" | "$zip_cmd" >| "$changed_hashes_file"
+                if [[ -f "$restore_hashes_file" ]]; then
+                    rm "$restore_hashes_file"
+                fi
+                if [[ -f "$restore_hashes_filenames_file" ]]; then
+                    rm "$restore_hashes_filenames_file"
+                fi
+                printf "Done.\nDifferences in $changed_hashes_file.\n\n"
+            else
+                _report_error "md5deep not found"
+            fi
+        else
+            _report_error "restore path $restore_path not a directory"
+        fi
+        ;;
+    *)
+        _report_error "invalid operation $operation. Try 'horcrux help' for more info"
+        ;;
+esac
+
+# Zip log file back up again
+if [[ -f "$log_file" ]]; then
+    printf "$(basename $0): zipping log file..."
+    eval "$zip_cmd" "$log_file"
+    printf " Done.\n\n"
+fi
